@@ -240,7 +240,8 @@ if(window.THREE){
    ['postprocessing/EffectComposer.js','sha384-GkidzTYmQg24v13sa3xhBBbvOLbVLO1QxfyKLdOWweQqNqS/iWwUst2T1fER2Xrg'],
    ['postprocessing/RenderPass.js','sha384-2EpLreWSFuZsk4hcSplXLhlHd/wzvDNF907bTGIXSXM0SlhJNzy4YK0DhBFvkFEs'],
    ['postprocessing/ShaderPass.js','sha384-I3lsvPeDJYFrEAzn/TA0yhc/SCYKwpyfyq8lKzHYKohu43H9f7xc/Q9ZWgSVUDl3'],
-   ['postprocessing/UnrealBloomPass.js','sha384-aVQ2QnWkoxhOefDB0YZB64OPVzujvccydpcC7UqMDJUK0ChwA382zOHmrWHGDRRa']]
+   ['postprocessing/UnrealBloomPass.js','sha384-aVQ2QnWkoxhOefDB0YZB64OPVzujvccydpcC7UqMDJUK0ChwA382zOHmrWHGDRRa'],
+   ['shaders/FXAAShader.js','sha384-No2tT0gxxdbq/aRJ3g6hqHsfLzAiS1uKg3Wz3r69GU/XGctg4GGZ3FKH3RN0wXGs']]
     .forEach(function(p){document.write('<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/'+p[0]+'" integrity="'+p[1]+'" crossorigin="anonymous"><\/script>');});
 }
 </script>
@@ -428,6 +429,7 @@ function resetState() {
     magnetT:0, x2:false, x2T:0,
     nearMisses:0, nextMilestone:500, best:0, bestShown:false,
     revived:false, fastFall:false, wakeT:0,
+    curveTimer:2, curveTgtX:0, curveTgtY:0,
     // For smooth level color interpolation
     levelFrac:0, prevLevel:0,
     // Camera FOV target
@@ -452,14 +454,42 @@ ren.shadowMap.enabled = true;
 ren.shadowMap.type = THREE.PCFSoftShadowMap;
 box.insertBefore(ren.domElement, box.firstChild);
 
-// ─── POST-PROCESSING (soft bloom — falls back to direct render if add-ons missing) ───
-let composer = null;
+// ─── POST-PROCESSING (bloom → underwater refraction → FXAA; falls back to direct render) ───
+let composer = null, waterPass = null, fxaaPass = null;
 try {
   if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass) {
     composer = new THREE.EffectComposer(ren);
     composer.addPass(new THREE.RenderPass(scene, cam));
     const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.6, 0.85);
     composer.addPass(bloom);
+    if (THREE.ShaderPass) {
+      // Custom underwater lens: gentle refraction wobble + chromatic aberration
+      // that grows toward the screen edges — sells the "through water" look.
+      waterPass = new THREE.ShaderPass({
+        uniforms: { tDiffuse:{value:null}, uTime:{value:0} },
+        vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+        fragmentShader: [
+          'uniform sampler2D tDiffuse; uniform float uTime; varying vec2 vUv;',
+          'void main(){',
+          '  vec2 uv = vUv;',
+          '  uv.x += sin(uv.y*26.0 + uTime*1.3)*0.0014;',
+          '  uv.y += cos(uv.x*21.0 + uTime*1.0)*0.0011;',
+          '  vec2 cc = uv - 0.5;',
+          '  vec2 off = cc * dot(cc,cc) * 0.018;',
+          '  float r = texture2D(tDiffuse, uv + off).r;',
+          '  float g = texture2D(tDiffuse, uv).g;',
+          '  float b = texture2D(tDiffuse, uv - off).b;',
+          '  gl_FragColor = vec4(r, g, b, 1.0);',
+          '}'].join('\n')
+      });
+      composer.addPass(waterPass);
+      if (THREE.FXAAShader) {
+        fxaaPass = new THREE.ShaderPass(THREE.FXAAShader);
+        const pr = ren.getPixelRatio();
+        fxaaPass.uniforms.resolution.value.set(1/(innerWidth*pr), 1/(innerHeight*pr));
+        composer.addPass(fxaaPass);
+      }
+    }
   }
 } catch(e) { composer = null; }
 
@@ -489,11 +519,46 @@ scene.environment = (() => {
   tex.needsUpdate=true; return tex;
 })();
 
+// ─── CURVED WORLD (Subway-Surfers-style view-space bend) ───
+// The whole world bends left/right (curves) and up/down (cascade drops) in the
+// vertex shader. Gameplay logic is untouched: the bend is ~zero near the player
+// (z≈0) and grows quadratically with distance, so collisions stay exact while
+// the canyon visibly winds and dives ahead.
+const CURVE = { x:{value:0}, y:{value:0} };
+function bendMaterial(mat){
+  if(!mat || mat._bent) return;
+  mat._bent = true;
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = shader => {
+    if(prev) prev(shader);
+    shader.uniforms.uCurveX = CURVE.x;
+    shader.uniforms.uCurveY = CURVE.y;
+    shader.vertexShader = 'uniform float uCurveX;\nuniform float uCurveY;\n' + shader.vertexShader.replace(
+      '#include <project_vertex>',
+      ['vec4 mvPosition = vec4( transformed, 1.0 );',
+       'mvPosition = modelViewMatrix * mvPosition;',
+       '{ float dCurve = clamp(-mvPosition.z - 6.0, 0.0, 160.0);',
+       '  mvPosition.x += uCurveX * dCurve * dCurve * 0.0004;',
+       '  mvPosition.y += uCurveY * dCurve * dCurve * 0.0004; }',
+       'gl_Position = projectionMatrix * mvPosition;'].join('\n')
+    );
+  };
+}
+{
+  const _sceneAdd = scene.add.bind(scene);
+  scene.add = function(...objs){
+    objs.forEach(o=>{ if(o&&o.traverse) o.traverse(c=>{
+      if(c.isMesh){ if(Array.isArray(c.material)) c.material.forEach(bendMaterial); else bendMaterial(c.material); }
+    }); });
+    return _sceneAdd(...objs);
+  };
+}
+
 // Lights
 const ambL = new THREE.AmbientLight(0x88c8d8, 0.5); scene.add(ambL);
 const sunL = new THREE.DirectionalLight(0xffffd0, 1.4); sunL.position.set(3, 80, -40); scene.add(sunL);
 sunL.castShadow = true;
-sunL.shadow.mapSize.set(1024,1024);
+sunL.shadow.mapSize.set(2048,2048);
 sunL.shadow.camera.left=-30; sunL.shadow.camera.right=30;
 sunL.shadow.camera.top=40; sunL.shadow.camera.bottom=-30;
 sunL.shadow.camera.near=20; sunL.shadow.camera.far=180;
@@ -709,6 +774,39 @@ function makeHangingKelp() {
   return g;
 }
 
+// ─── SAND CASCADES (underwater sandfalls pouring off wall ledges) ───
+// One shared scrolling streak texture; every fall reuses it, so animation
+// costs a single texture offset update per frame.
+const sandfallTex = (() => {
+  const cv=document.createElement('canvas'); cv.width=64; cv.height=256;
+  const c=cv.getContext('2d');
+  c.clearRect(0,0,64,256);
+  for(let i=0;i<26;i++){
+    const x=Math.random()*64, w=1+Math.random()*2.5, a=0.10+Math.random()*0.30;
+    const g=c.createLinearGradient(0,0,0,256);
+    g.addColorStop(0,`rgba(240,224,180,0)`);
+    g.addColorStop(0.15,`rgba(240,224,180,${a})`);
+    g.addColorStop(0.85,`rgba(232,214,168,${a*0.8})`);
+    g.addColorStop(1,`rgba(232,214,168,0)`);
+    c.fillStyle=g; c.fillRect(x,0,w,256);
+  }
+  for(let i=0;i<40;i++){
+    c.fillStyle=`rgba(248,236,200,${0.15+Math.random()*0.3})`;
+    c.fillRect(Math.random()*64,Math.random()*256,1.5,3+Math.random()*5);
+  }
+  const tex=new THREE.CanvasTexture(cv);
+  tex.wrapT=THREE.RepeatWrapping;
+  return tex;
+})();
+function makeSandfall(){
+  const h=5+Math.random()*4;
+  const m=new THREE.Mesh(
+    new THREE.PlaneGeometry(1.2+Math.random()*0.8,h),
+    new THREE.MeshBasicMaterial({map:sandfallTex,transparent:true,opacity:0.4+Math.random()*0.2,depthWrite:false,side:THREE.DoubleSide}));
+  m.userData.fallH=h;
+  return m;
+}
+
 function makeCanyonWall(side, z) {
   const wallG = new THREE.Group();
   const xBase = side*6.5;
@@ -739,6 +837,12 @@ function makeCanyonWall(side, z) {
     ledge.position.set(xBase+side*(-0.5+Math.random()), 1+i*3+Math.random()*2, (Math.random()-0.5)*C.segLen*0.5);
     wallG.add(ledge);
     if(Math.random()<0.7){const coral=makeWallCoral();coral.position.copy(ledge.position);coral.position.y+=lh*0.5+0.3;coral.position.x-=side*0.3;wallG.add(coral);}
+    if(Math.random()<0.35){
+      const sf=makeSandfall();
+      sf.position.set(ledge.position.x-side*(lw*0.5+0.15), ledge.position.y-sf.userData.fallH*0.5+0.1, ledge.position.z);
+      sf.rotation.y=-side*Math.PI/2+(Math.random()-0.5)*0.4;
+      wallG.add(sf);
+    }
   }
   for(let i=0;i<2+Math.floor(Math.random()*3);i++){
     const coral=makeWallCoral();
@@ -866,6 +970,7 @@ const caustic = (() => {
   const c2=cv.getContext('2d');
   const tex=new THREE.CanvasTexture(cv);
   tex.wrapS=tex.wrapT=THREE.RepeatWrapping; tex.repeat.set(4,4);
+  tex.anisotropy=ren.capabilities.getMaxAnisotropy();
   // Precompute stable sand speckles so they don't shimmer between frames
   const speckles=[];
   for(let i=0;i<420;i++) speckles.push({x:Math.random()*SZ,y:Math.random()*SZ,r:0.5+Math.random()*1.4,c:Math.random()>0.5?'rgba(214,196,150,0.30)':'rgba(10,40,52,0.30)'});
@@ -1541,6 +1646,15 @@ function loop(now){
     // Magnet / 2x score timers
     if(S.magnetT>0){ S.magnetT-=dt; if(S.magnetT<=0)$mb.classList.remove('show'); }
     if(S.x2){ S.x2T-=dt; if(S.x2T<=0){ S.x2=false; $x2b.classList.remove('show'); } }
+
+    // Winding canyon: retarget the world bend every few seconds.
+    // Negative Y targets are cascade drops — the track ahead dives away.
+    S.curveTimer-=dt;
+    if(S.curveTimer<=0){
+      S.curveTimer=5+Math.random()*5;
+      S.curveTgtX=(Math.random()-0.5)*1.5;
+      S.curveTgtY=Math.random()<0.35?-(0.4+Math.random()*0.8):(Math.random()-0.5)*0.7;
+    }
     // Invincibility
     if(S.invincible){
       S.invincibleT-=dt;
@@ -1812,6 +1926,14 @@ function loop(now){
     M.anemone2.emissiveIntensity=0.3+bioIntensity;
   }
   // ─── AMBIENT (always) ───
+  // Ease the world bend toward its target (returns to straight outside runs)
+  const curveOn=S.on&&!S.paused;
+  CURVE.x.value+=((curveOn?S.curveTgtX:0)-CURVE.x.value)*0.012;
+  CURVE.y.value+=((curveOn?S.curveTgtY:0)-CURVE.y.value)*0.012;
+  // Sand cascades pour continuously (one shared texture scroll)
+  sandfallTex.offset.y-=dt*0.55;
+  // Underwater lens shader time
+  if(waterPass) waterPass.uniforms.uTime.value=t;
   // Sun disc tracks the current biome's light level
   sunDisc.material.opacity=0.05+sunL.intensity*0.12+0.02*Math.sin(t*0.8);
   sunHalo.material.opacity=0.02+sunL.intensity*0.04;
@@ -1858,7 +1980,12 @@ function loop(now){
   if(composer) composer.render(); else ren.render(scene,cam);
 }
 
-window.addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();ren.setSize(innerWidth,innerHeight);if(composer)composer.setSize(innerWidth,innerHeight);});
+window.addEventListener('resize',()=>{
+  cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();
+  ren.setSize(innerWidth,innerHeight);
+  if(composer)composer.setSize(innerWidth,innerHeight);
+  if(fxaaPass){const pr=ren.getPixelRatio();fxaaPass.uniforms.resolution.value.set(1/(innerWidth*pr),1/(innerHeight*pr));}
+});
 initWorld();
 const _ib=getScores()[0]||0;if(_ib>0)document.getElementById('final-best').textContent='BEST: '+_ib;
 loop(0);

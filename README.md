@@ -21,8 +21,10 @@ that pulls in nearby pearls.
 
 ## Features
 
-- **5 biomes** with smooth colour-graded transitions, animated caustics, god rays and a
-  procedural sunken temple that drifts by
+- **Winding canyon** — the world bends into curves and cascade drops ahead of you
+  (vertex-shader world bend, so lane controls stay pixel-exact)
+- **5 biomes** with smooth colour-graded transitions, animated caustics, god rays,
+  sand cascades pouring off the canyon ledges, and a procedural sunken temple that drifts by
 - **Power-ups:** shield 🛡, magnet 🧲, and 2× score ✨
 - **Skill rewards:** near-miss bonuses ("CLOSE!"), combo multiplier, pearl arcs over obstacles
 - **One revive per run**, slow-motion last-life moments, distance milestones, live NEW BEST chase
@@ -36,5 +38,6 @@ that pulls in nearby pearls.
   fallback CDN; a strict `Content-Security-Policy` meta tag limits scripts to those hosts
 - No analytics, no cookies, no network calls besides the CDN libraries and Google Fonts
 - Unhandled startup errors are rendered with `textContent` (no HTML injection)
-- WebGL with soft shadows, ACES tone mapping and an optional Unreal-style bloom pass
-  (falls back to plain rendering automatically)
+- WebGL with 2K soft shadows, ACES tone mapping and a post-processing chain:
+  Unreal-style bloom → custom underwater refraction & chromatic aberration shader → FXAA
+  (falls back to plain rendering automatically if the add-ons fail to load)
